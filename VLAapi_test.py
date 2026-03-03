@@ -199,6 +199,203 @@ def test_vlm_question_about_image(image_path="test.png"):
         print(f"❌ VLM问答测试失败: {e}")
         return False
 
+def test_grounding_click_location(image_path="test.png", output_dir="grounding_results"):
+    """
+    Grounding测试：让VLM输出鼠标操作坐标，并在图片上标记用于人工校对
+    """
+    print("\n" + "="*50)
+    print("🎯 测试5: Grounding - 鼠标点击位置预测")
+    print("="*50)
+
+    if not os.path.exists(image_path):
+        print(f"❌ 图像文件不存在: {image_path}")
+        return False
+
+    # 创建输出目录
+    os.makedirs(output_dir, exist_ok=True)
+
+    try:
+        from PIL import Image, ImageDraw
+
+        base64_image = encode_image(image_path)
+
+        models = client.models.list()
+        model_id = models.data[0].id
+
+        print(f"📸 分析屏幕截图: {image_path}")
+
+        # 需要预测点击位置的任务
+        tasks = [
+            {
+                "task": "点击打开桌面上的'项目文件夹'",
+                "description": "找到并点击屏幕上的'项目文件夹'项"
+            },
+            {
+                "task": "点击窗口的关闭按钮",
+                "description": "找到文件管理器窗口的关闭按钮(×)并点击"
+            },
+            {
+                "task": "点击记事本窗口的任意位置",
+                "description": "找到右侧的记事本窗口并点击"
+            },
+            {
+                "task": "点击任务栏的开始按钮",
+                "description": "找到并点击任务栏左侧的Windows开始按钮"
+            }
+        ]
+
+        results = []
+
+        for i, task_info in enumerate(tasks, 1):
+            task = task_info["task"]
+            print(f"\n📌 任务{i}: {task}")
+
+            # 构造prompt，要求输出像素坐标
+            prompt = f"""你是一个GUI操作助手。根据屏幕截图，你需要执行以下任务：
+任务：{task}
+{task_info["description"]}
+
+请以JSON格式输出你的决策，格式如下：
+{{
+    "action": "click",  // 操作类型：click, move, 或 none
+    "x": 整数值,        // X坐标（像素值，从0开始）
+    "y": 整数值,        // Y坐标（像素值，从0开始）
+    "reason": "简短说明你为什么选择这个位置"
+}}
+
+注意：
+1. 坐标是绝对像素坐标，基于当前截图的分辨率
+2. 输出纯JSON，不要有其他内容
+3. 如果任务无法完成，action设为"none"
+"""
+
+            response = client.chat.completions.create(
+                model=model_id,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "image_url",
+                                "image_url": {
+                                    "url": f"data:image/png;base64,{base64_image}"
+                                }
+                            },
+                            {
+                                "type": "text",
+                                "text": prompt
+                            }
+                        ]
+                    }
+                ],
+                max_tokens=200,
+                temperature=0.1
+            )
+
+            content = response.choices[0].message.content
+            print(f"🤖 原始响应: {content[:200]}...")
+
+            # 解析JSON响应
+            import json
+            import re
+
+            # 尝试提取JSON
+            json_match = re.search(r'\{[\s\S]*\}', content)
+            if json_match:
+                try:
+                    # 移除JavaScript风格的注释 (// ...) 因为JSON不支持注释
+                    json_str = json_match.group()
+                    json_str = re.sub(r'//.*$', '', json_str, flags=re.MULTILINE)
+                    result = json.loads(json_str)
+                    print(f"✅ 解析成功: action={result.get('action')}, x={result.get('x')}, y={result.get('y')}")
+                    print(f"   理由: {result.get('reason', 'N/A')}")
+                    results.append({
+                        "task": task,
+                        "result": result,
+                        "raw_output": content,
+                        "success": result.get('action') == 'click'
+                    })
+                except json.JSONDecodeError as e:
+                    print(f"❌ JSON解析失败: {e}")
+                    results.append({
+                        "task": task,
+                        "result": None,
+                        "raw_output": content,
+                        "success": False
+                    })
+            else:
+                print("❌ 未找到有效的JSON响应")
+                results.append({
+                    "task": task,
+                    "result": None,
+                    "raw_output": content,
+                    "success": False
+                })
+
+        # 为每个任务单独保存结果
+        print("\n" + "-"*50)
+        print("💾 保存每个任务的原始输出和标记图...")
+
+        colors = ['red', 'lime', 'cyan', 'yellow', 'magenta', 'orange']
+
+        for i, res in enumerate(results, 1):
+            task_name = res['task'][:20].replace('/', '_').replace(' ', '_')
+
+            # 保存原始输出
+            raw_path = os.path.join(output_dir, f"{i}_{task_name}_raw.txt")
+            with open(raw_path, 'w', encoding='utf-8') as f:
+                f.write(f"任务: {res['task']}\n")
+                f.write(f"原始输出:\n{res.get('raw_output', 'N/A')}\n")
+            print(f"   原始输出: {raw_path}")
+
+            # 生成单独的标记图
+            if res["result"] and res["result"].get("action") == "click":
+                img = Image.open(image_path)
+                draw = ImageDraw.Draw(img)
+
+                x = res["result"].get("x")
+                y = res["result"].get("y")
+                color = colors[i % len(colors)]
+
+                if x is not None and y is not None:
+                    # 绘制十字标记
+                    cross_size = 15
+                    draw.line([(x - cross_size, y), (x + cross_size, y)], fill=color, width=2)
+                    draw.line([(x, y - cross_size), (x, y + cross_size)], fill=color, width=2)
+
+                    # 绘制圆圈
+                    radius = 20
+                    draw.ellipse([x - radius, y - radius, x + radius, y + radius],
+                                outline=color, width=3)
+
+                    # 添加任务描述
+                    draw.text((x + 25, y - 25), f"#{i}", fill=color)
+
+                marked_path = os.path.join(output_dir, f"{i}_{task_name}_marked.png")
+                img.save(marked_path)
+                print(f"   标记图: {marked_path}")
+
+        # 打印汇总
+        print("\n" + "="*50)
+        print("📊 Grounding测试结果汇总")
+        print("="*50)
+        success_count = sum(1 for r in results if r["success"])
+        for i, res in enumerate(results, 1):
+            status = "✅" if res["success"] else "❌"
+            print(f"{status} 任务{i}: {res['task']}")
+            if res["result"]:
+                print(f"    坐标: ({res['result'].get('x')}, {res['result'].get('y')})")
+        print(f"\n📈 成功率: {success_count}/{len(results)} ({100*success_count/len(results):.1f}%)")
+
+        return success_count > 0
+
+    except Exception as e:
+        print(f"❌ Grounding测试失败: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def test_vlm_multiple_images():
     """测试多图输入（如果模型支持）- 用于GUI自动化场景"""
     print("\n" + "="*50)
@@ -350,6 +547,7 @@ def main():
         ("文本测试", test_text_only),
         ("图像描述测试", lambda: test_vlm_image_description("test.png")),
         ("图像问答测试", lambda: test_vlm_question_about_image("test.png")),
+        ("Grounding点击位置测试", lambda: test_grounding_click_location("test.png")),
         ("多图测试", test_vlm_multiple_images)
     ]
     
